@@ -73,6 +73,7 @@ type JWKS struct {
 	givenKIDOverride    bool
 	jwksURL             string
 	keys                map[string]parsedJWK
+	externalKeys        map[string]parsedJWK
 	mux                 sync.RWMutex
 	refreshErrorHandler ErrorHandler
 	refreshInterval     time.Duration
@@ -82,6 +83,58 @@ type JWKS struct {
 	refreshUnknownKID   bool
 	requestFactory      func(ctx context.Context, url string) (*http.Request, error)
 	responseExtractor   func(ctx context.Context, resp *http.Response) (json.RawMessage, error)
+}
+
+// SetExternalKeys is used to add JWKs found outside of the certs url
+//
+// External Keys will only be used to verify a JWT, they will not be returned in RawJWKS, or Kids methods
+func (j *JWKS) SetExternalKeys(rawKeys json.RawMessage) error {
+	j.mux.Lock()
+	defer j.mux.Unlock()
+	var rawKS rawJWKS
+	err := json.Unmarshal(rawKeys, &rawKS)
+	if err != nil {
+		return err
+	}
+
+	j.externalKeys = make(map[string]parsedJWK, len(rawKS.Keys))
+
+	for _, key := range rawKS.Keys {
+		var keyInter interface{}
+		switch keyType := key.Type; keyType {
+		case ktyEC:
+			keyInter, err = key.ECDSA()
+			if err != nil {
+				continue
+			}
+		case ktyOKP:
+			keyInter, err = key.EdDSA()
+			if err != nil {
+				continue
+			}
+		case ktyOct:
+			keyInter, err = key.Oct()
+			if err != nil {
+				continue
+			}
+		case ktyRSA:
+			keyInter, err = key.RSA()
+			if err != nil {
+				continue
+			}
+		default:
+			// Ignore unknown key types silently.
+			continue
+		}
+
+		j.externalKeys[key.ID] = parsedJWK{
+			algorithm: key.Algorithm,
+			use:       JWKUse(key.Use),
+			public:    keyInter,
+		}
+	}
+
+	return nil
 }
 
 // rawJWKS represents a JWKS in JSON format.
@@ -191,6 +244,9 @@ func (j *JWKS) ReadOnlyKeys() map[string]interface{} {
 func (j *JWKS) getKey(alg, kid string) (jsonKey interface{}, err error) {
 	j.mux.RLock()
 	pubKey, ok := j.keys[kid]
+	if !ok {
+		pubKey, ok = j.externalKeys[kid]
+	}
 	j.mux.RUnlock()
 
 	if !ok {
